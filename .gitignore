@@ -28,3 +28,8 @@ Thumbs.db
 *.png
 login_error.png
 
+
+# Added by Apify CLI
+storage
+node_modules
+.venv

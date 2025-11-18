@@ -1,33 +1,37 @@
-/**
- * Instagram scraper rewritten for the Apify Actor runtime.
- * - Accepts input via Actor.getInput()
- * - Uses Apify proxy configuration when requested
- * - Pushes data to the default dataset and saves JSON locally
- * - Retains the original anti-detection measures and per-item pacing
- */
+import express from 'express';
+import chromium from 'chrome-aws-lambda';
+import puppeteerCore from 'puppeteer-core';
+import puppeteerExtra from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import randomUseragent from 'random-useragent';
+import fs from 'fs/promises';
+import path from 'path';
+import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import { ensureSessionDir, loadSession, saveSession } from './sessionManager.js';
 
-const { Actor, log } = require('apify');
-const puppeteerExtra = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const randomUseragent = require('random-useragent');
-const fs = require('fs').promises;
-const path = require('path');
-const { ensureSessionDir, loadSession, saveSession } = require('./sessionManager');
-require('dotenv').config();
+dotenv.config();
 
+puppeteerExtra.use(StealthPlugin());
 const puppeteer = puppeteerExtra;
-puppeteer.use(StealthPlugin());
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 let proxyCursor = 0;
 let accountCursor = 0;
 const cursorLock = { proxy: false, account: false };
-let apifyProxyConfiguration = null;
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
 
 const CONFIG = {
   INSTAGRAM_USERNAME: process.env.IG_USERNAME || '',
   INSTAGRAM_PASSWORD: process.env.IG_PASSWORD || '',
   DAYS_TO_SCRAPE: parseInt(process.env.DAYS_TO_SCRAPE, 10) || 2,
-  OUTPUT_DIR: process.env.OUTPUT_DIR || './scraped_instagram',
+  OUTPUT_DIR: process.env.OUTPUT_DIR || path.join(__dirname, 'scraped_instagram'),
   MAX_POSTS: parseInt(process.env.MAX_POSTS, 10) || 500,
   MAX_REELS: parseInt(process.env.MAX_REELS, 10) || 500,
   LOAD_DELAY: 3000,
@@ -46,8 +50,8 @@ const CONFIG = {
   ],
   RATE_LIMIT_COOLDOWN_MS: [120000, 240000],
   MAX_RATE_LIMIT_EVENTS: 3,
-  POSTS_PER_RUN_LIMIT: parseInt(process.env.POSTS_PER_RUN_LIMIT, 10) || 150,
-  REELS_PER_RUN_LIMIT: parseInt(process.env.REELS_PER_RUN_LIMIT, 10) || 150,
+  POSTS_PER_RUN_LIMIT: 150,
+  REELS_PER_RUN_LIMIT: 150,
   RUN_LOG_FILE: 'instagram_run_logs.jsonl',
   ITEM_COOLDOWN_RANGE_MS: [2500, 5500],
   BATCH_SIZE_BEFORE_BREAK: 8,
@@ -66,20 +70,8 @@ const CONFIG = {
     .map(group => group.trim())
     .filter(Boolean),
   APIFY_PROXY_COUNTRY: process.env.APIFY_PROXY_COUNTRY || '',
-  APIFY_PROXY_SESSION_PREFIX: process.env.APIFY_PROXY_SESSION_PREFIX || 'ig-session',
-  DEFAULT_PROFILE_URL: process.env.DEFAULT_PROFILE_URL || ''
+  APIFY_PROXY_SESSION_PREFIX: process.env.APIFY_PROXY_SESSION_PREFIX || 'ig-session'
 };
-
-const VALID_PERIODS = [
-  '1h', '1hour',
-  '3h', '3hours',
-  '6h', '6hours',
-  '12h', '12hours',
-  '24h', '24hours', '1day', '1d',
-  '1w', '1week', '7days', '7d',
-  '1m', '1month', '30days', '30d',
-  '1y', '1year', '365days', '365d'
-];
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -148,18 +140,68 @@ async function getNextAccount() {
   return account;
 }
 
-async function createApifyProxyConfiguration() {
-  if (!CONFIG.USE_APIFY_PROXY) return null;
-  if (apifyProxyConfiguration) return apifyProxyConfiguration;
+async function resolveExecutablePath() {
+  const isLambda = !!process.env.AWS_LAMBDA_FUNCTION_VERSION;
+  if (isLambda) {
+    return await chromium.executablePath;
+  }
 
-  apifyProxyConfiguration = await Actor.createProxyConfiguration({
-    groups: CONFIG.APIFY_PROXY_GROUPS.length ? CONFIG.APIFY_PROXY_GROUPS : undefined,
-    countryCode: CONFIG.APIFY_PROXY_COUNTRY || undefined
-  });
-  return apifyProxyConfiguration;
+  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
+
+  return await chromium.executablePath;
 }
 
-async function getManualProxy() {
+async function createChromiumLaunchOptions(proxyUrl) {
+  const executablePath = await resolveExecutablePath();
+
+  const defaultArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--window-size=1920,1080'
+  ];
+
+  const chromiumArgs = chromium.args || [];
+  const args = Array.from(new Set([...chromiumArgs, ...defaultArgs]));
+  if (proxyUrl) {
+    args.push(`--proxy-server=${proxyUrl}`);
+  }
+
+  return {
+    executablePath,
+    headless: process.env.HEADLESS !== 'false',
+    args,
+    defaultViewport: null,
+    ignoreHTTPSErrors: true
+  };
+}
+
+async function createApifyProxyUrl() {
+  const password = process.env.APIFY_PROXY_PASSWORD;
+  if (!password) {
+    throw new Error('Apify proxy enabled but APIFY_PROXY_PASSWORD is not set.');
+  }
+
+  const segments = [];
+  if (CONFIG.APIFY_PROXY_GROUPS.length) {
+    segments.push(`groups-${CONFIG.APIFY_PROXY_GROUPS.join('+')}`);
+  }
+  if (CONFIG.APIFY_PROXY_COUNTRY) {
+    segments.push(`country-${CONFIG.APIFY_PROXY_COUNTRY}`);
+  }
+  segments.push(`session-${CONFIG.APIFY_PROXY_SESSION_PREFIX}-${Date.now().toString(36)}`);
+
+  const username = segments.join(',') || 'auto';
+  return `http://${username}:${password}@proxy.apify.com:8000`;
+}
+
+async function getNextProxy() {
+  if (CONFIG.USE_APIFY_PROXY) {
+    return createApifyProxyUrl();
+  }
+
   if (!CONFIG.USE_PROXIES) return null;
   const pool = CONFIG.PROXIES.filter(Boolean);
   if (!pool.length) return null;
@@ -176,32 +218,11 @@ async function getManualProxy() {
   return proxy;
 }
 
-async function resolveProxyUrl() {
-  if (CONFIG.USE_APIFY_PROXY) {
-    const proxyConfig = await createApifyProxyConfiguration();
-    if (!proxyConfig) {
-      log.warning('USE_APIFY_PROXY is true but no Apify proxy configuration is available.');
-      return null;
-    }
-    const proxyUrl = await proxyConfig.newUrl();
-    log.info(`🌐 Using Apify proxy ${proxyUrl}`);
-    return proxyUrl;
-  }
-
-  const manualProxy = await getManualProxy();
-  if (manualProxy) {
-    log.info(`🌐 Using manual proxy ${manualProxy}`);
-  } else {
-    log.info('🌐 Running without proxy');
-  }
-  return manualProxy;
-}
-
 async function handleRateLimitPause(runMetrics) {
-  log.warning('🚧 Rate limit detected. Entering cooldown...');
+  console.log('🚧 Rate limit detected. Cooling down...');
   runMetrics.rateLimitEvents += 1;
   if (runMetrics.rateLimitEvents >= CONFIG.MAX_RATE_LIMIT_EVENTS) {
-    log.error('⚠️ Rate limit threshold exceeded for this run.');
+    console.log('⚠️ Rate limit threshold exceeded for this run.');
     throw new Error('Too many rate-limit responses; aborting run to protect account.');
   }
   await randomPause(CONFIG.RATE_LIMIT_COOLDOWN_MS);
@@ -218,7 +239,7 @@ async function isRateLimited(page) {
       normalized.includes('we restrict certain activity')
     );
   } catch (error) {
-    log.warning(`Rate-limit check failed: ${error.message}`);
+    console.log('Rate-limit check failed:', error.message);
     return false;
   }
 }
@@ -229,7 +250,7 @@ async function appendRunLog(entry) {
     const logPath = path.join(CONFIG.OUTPUT_DIR, CONFIG.RUN_LOG_FILE);
     await fs.appendFile(logPath, JSON.stringify(entry) + '\n', 'utf8');
   } catch (error) {
-    log.warning(`Unable to write run log: ${error.message}`);
+    console.log('⚠️ Unable to write run log:', error.message);
   }
 }
 
@@ -239,7 +260,7 @@ async function maybeTakeBatchBreak(processedCount, typeLabel = 'items') {
     processedCount > 0 &&
     processedCount % CONFIG.BATCH_SIZE_BEFORE_BREAK === 0
   ) {
-    log.info(`💤 Taking a longer rest after ${processedCount} ${typeLabel}...`);
+    console.log(`\n💤 Taking a longer rest after ${processedCount} ${typeLabel}...`);
     await randomPause(CONFIG.BATCH_BREAK_RANGE_MS);
   }
 }
@@ -247,9 +268,9 @@ async function maybeTakeBatchBreak(processedCount, typeLabel = 'items') {
 async function ensureOutputDir() {
   try {
     await fs.mkdir(CONFIG.OUTPUT_DIR, { recursive: true });
-    log.info(`Output directory ready: ${CONFIG.OUTPUT_DIR}`);
+    console.log('✓ Output directory ready:', CONFIG.OUTPUT_DIR);
   } catch (error) {
-    log.error(`Error creating output directory: ${error.message}`);
+    console.error('Error creating output directory:', error);
   }
 }
 
@@ -259,12 +280,10 @@ function getDateThreshold() {
 }
 
 function getDateThresholdByPeriod(period) {
-  if (!period) return getDateThreshold();
-
   const now = new Date();
   let milliseconds = 0;
 
-  switch (period.toLowerCase()) {
+  switch (period?.toLowerCase()) {
     case '1h':
     case '1hour':
       milliseconds = 1 * 60 * 60 * 1000;
@@ -273,36 +292,24 @@ function getDateThresholdByPeriod(period) {
     case '3hours':
       milliseconds = 3 * 60 * 60 * 1000;
       break;
-    case '6h':
-    case '6hours':
-      milliseconds = 6 * 60 * 60 * 1000;
-      break;
-    case '12h':
-    case '12hours':
-      milliseconds = 12 * 60 * 60 * 1000;
-      break;
     case '24h':
     case '24hours':
     case '1day':
-    case '1d':
       milliseconds = 24 * 60 * 60 * 1000;
       break;
     case '1w':
     case '1week':
     case '7days':
-    case '7d':
       milliseconds = 7 * 24 * 60 * 60 * 1000;
       break;
     case '1m':
     case '1month':
     case '30days':
-    case '30d':
       milliseconds = 30 * 24 * 60 * 60 * 1000;
       break;
     case '1y':
     case '1year':
     case '365days':
-    case '365d':
       milliseconds = 365 * 24 * 60 * 60 * 1000;
       break;
     default:
@@ -341,7 +348,7 @@ async function loginToInstagram(page, credentials) {
     password: CONFIG.INSTAGRAM_PASSWORD
   };
   try {
-    log.info('Attempting to login...');
+    console.log('Attempting to login...');
     await page.goto('https://www.instagram.com/accounts/login/', {
       waitUntil: 'networkidle0',
       timeout: 60000
@@ -350,19 +357,19 @@ async function loginToInstagram(page, credentials) {
     await page.waitForSelector('input[name="username"]', { timeout: 15000 });
     await randomPause(CONFIG.HUMAN_PAUSE_RANGE_MS);
 
-    log.info(`Entering credentials for ${creds.username}...`);
+    console.log(`Entering credentials for ${creds.username}...`);
     const typingDelay = randomBetween(80, 160);
     await page.type('input[name="username"]', creds.username, { delay: typingDelay });
     await randomPause();
     await page.type('input[name="password"]', creds.password, { delay: typingDelay });
     await randomPause();
 
-    log.info('Clicking login button...');
+    console.log('Clicking login button...');
     await page.click('button[type="submit"]');
     await randomPause(CONFIG.HUMAN_PAUSE_RANGE_MS);
 
     const currentUrl = page.url();
-    log.info(`Current URL after login: ${currentUrl}`);
+    console.log('Current URL after login:', currentUrl);
 
     if (currentUrl.includes('/accounts/login') || currentUrl.includes('/challenge')) {
       const errorMessage = await page.evaluate(() => {
@@ -374,7 +381,7 @@ async function loginToInstagram(page, credentials) {
       if (currentUrl.includes('/challenge')) throw new Error('Login requires verification');
     }
 
-    log.info('✓ Login successful, handling prompts...');
+    console.log('✓ Login successful, handling prompts...');
 
     try {
       await randomPause(CONFIG.HUMAN_PAUSE_RANGE_MS);
@@ -383,13 +390,13 @@ async function loginToInstagram(page, credentials) {
         const text = await page.evaluate(el => el.textContent, button);
         if (text && (text.includes('Not Now') || text.includes('Not now'))) {
           await button.click();
-          log.info('✓ Clicked "Not Now" for save login');
+          console.log('✓ Clicked "Not Now" for save login');
           await randomPause();
           break;
         }
       }
-    } catch (e) {
-      log.info('No save login prompt');
+    } catch {
+      console.log('No save login prompt');
     }
 
     try {
@@ -399,32 +406,29 @@ async function loginToInstagram(page, credentials) {
         const text = await page.evaluate(el => el.textContent, button);
         if (text && (text.includes('Not Now') || text.includes('Not now'))) {
           await button.click();
-          log.info('✓ Clicked "Not Now" for notifications');
+          console.log('✓ Clicked "Not Now" for notifications');
           await randomPause();
           break;
         }
       }
-    } catch (e) {
-      log.info('No notification prompt');
+    } catch {
+      console.log('No notification prompt');
     }
 
-    log.info('✓ Login complete and ready to scrape');
+    console.log('✓ Login complete and ready to scrape');
     return true;
   } catch (error) {
-    log.error(`❌ Login failed: ${error.message}`);
+    console.error('❌ Login failed:', error.message);
     try {
       await page.screenshot({ path: 'login_error.png' });
-      log.info('Screenshot saved: login_error.png');
-    } catch (e) {
-      log.warning('Unable to capture login error screenshot');
-    }
+      console.log('Screenshot saved: login_error.png');
+    } catch {}
     return false;
   }
 }
 
 async function scrollAndLoadContent(page) {
-  log.info('Scrolling to load more content...');
-
+  console.log('Scrolling to load more content...');
   let previousHeight = 0;
   let scrollAttempts = 0;
   const maxScrolls = 5;
@@ -433,7 +437,7 @@ async function scrollAndLoadContent(page) {
     const currentHeight = await page.evaluate(() => document.body.scrollHeight);
 
     if (currentHeight === previousHeight) {
-      log.info('Reached end of content or no new content loaded');
+      console.log('Reached end of content or no new content loaded');
       break;
     }
 
@@ -442,7 +446,7 @@ async function scrollAndLoadContent(page) {
 
     previousHeight = currentHeight;
     scrollAttempts++;
-    log.info(`Scroll ${scrollAttempts}/${maxScrolls}`);
+    console.log(`Scroll ${scrollAttempts}/${maxScrolls}`);
   }
 }
 
@@ -527,10 +531,10 @@ async function extractPostDetails(page, postNumber) {
       };
     });
 
-    log.info(`✓ Post #${postNumber}: ${postData.likes} likes | ${postData.timeText}`);
+    console.log(`✓ Post #${postNumber}: ${postData.likes} likes | ${postData.timeText}`);
     return postData;
   } catch (error) {
-    log.error(`Error extracting post: ${error.message}`);
+    console.error('Error extracting post:', error.message);
     return null;
   }
 }
@@ -613,10 +617,10 @@ async function extractReelDetails(page, reelNumber) {
       };
     });
 
-    log.info(`✓ Reel #${reelNumber}: ${reelData.views} views | ${reelData.likes} likes | ${reelData.timeText}`);
+    console.log(`✓ Reel #${reelNumber}: ${reelData.views} views | ${reelData.likes} likes | ${reelData.timeText}`);
     return reelData;
   } catch (error) {
-    log.error(`Error extracting reel: ${error.message}`);
+    console.error('Error extracting reel:', error.message);
     return null;
   }
 }
@@ -624,23 +628,24 @@ async function extractReelDetails(page, reelNumber) {
 async function isLoggedIn(page) {
   try {
     return await page.evaluate(() => {
-      const navIcon = document.querySelector('svg[aria-label="Home"]') || document.querySelector('svg[aria-label="Create"]');
+      const navIcon =
+        document.querySelector('svg[aria-label="Home"]') || document.querySelector('svg[aria-label="Create"]');
       const loginInput = document.querySelector('input[name="username"]');
       return !!navIcon || !loginInput;
     });
   } catch (error) {
-    log.warning(`Login status check failed: ${error.message}`);
+    console.log('Login status check failed:', error.message);
     return false;
   }
 }
 
-async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, proxyOverride = null) {
+async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null) {
   const reqId = requestId || `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
   let browser;
   const account = await getNextAccount();
   const sessionLabel = sanitizeLabel(account.username);
-  const proxyUsed = proxyOverride || null;
+  const proxyUsed = await getNextProxy();
 
   const runMetrics = {
     requestId: reqId,
@@ -653,31 +658,16 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
     rateLimitEvents: 0,
     notes: []
   };
-
   const scrapedPosts = [];
   const scrapedReels = [];
   let postLimitReached = false;
   let reelLimitReached = false;
 
   try {
-    log.info(`[${reqId}] Launching browser...`);
-    const launchArgs = [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--window-size=1920,1080',
-      '--disable-blink-features=AutomationControlled'
-    ];
+    console.log(`[${reqId}] Launching browser...`);
+    const launchOptions = await createChromiumLaunchOptions(proxyUsed);
 
-    if (proxyUsed) {
-      launchArgs.push(`--proxy-server=${proxyUsed}`);
-      log.info(`[${reqId}] 🌐 Using proxy: ${proxyUsed}`);
-    }
-
-    browser = await puppeteer.launch({
-      headless: process.env.HEADLESS !== 'false',
-      args: launchArgs
-    });
+    browser = await puppeteer.launch(launchOptions);
 
     const mainPage = await browser.newPage();
     await mainPage.setViewport(getRandomViewport());
@@ -685,7 +675,7 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
 
     const dateThreshold = timePeriod ? getDateThresholdByPeriod(timePeriod) : getDateThreshold();
     if (timePeriod) {
-      log.info(`[${reqId}] 📅 Filtering content from last: ${timePeriod}`);
+      console.log(`[${reqId}] 📅 Filtering content from last: ${timePeriod}`);
     }
 
     await ensureSessionDir(sessionLabel);
@@ -699,6 +689,7 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
     }
 
     let loggedIn = await isLoggedIn(mainPage);
+
     if (!loggedIn) {
       const loginSuccess = await loginToInstagram(mainPage, account);
       if (!loginSuccess) {
@@ -707,10 +698,10 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
       await saveSession(mainPage, sessionLabel);
       loggedIn = true;
     } else {
-      log.info('✓ Using existing Instagram session');
+      console.log('✓ Using existing Instagram session');
     }
 
-    log.info(`[${reqId}] Navigating to profile: ${profileUrl}...`);
+    console.log(`[${reqId}] Navigating to profile: ${profileUrl}...`);
     await mainPage.goto(profileUrl, {
       waitUntil: 'networkidle0',
       timeout: 60000
@@ -720,11 +711,11 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
       await mainPage.reload({ waitUntil: 'networkidle0', timeout: 60000 });
     }
     await sleep(4000);
-    log.info('✓ Profile page loaded');
+    console.log('✓ Profile page loaded');
 
     await scrollAndLoadContent(mainPage);
 
-    log.info('Collecting content URLs...');
+    console.log('\nCollecting content URLs...');
     await sleep(2000);
 
     const contentUrls = await mainPage.evaluate(() => {
@@ -753,11 +744,11 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
       };
     });
 
-    log.info(`📊 Found ${contentUrls.posts.length} posts and ${contentUrls.reels.length} reels`);
+    console.log(`\n📊 Found ${contentUrls.posts.length} posts and ${contentUrls.reels.length} reels`);
 
     const processedIds = new Set();
 
-    log.info('📸 Starting to scrape POSTS...');
+    console.log(`\n📸 Starting to scrape POSTS...\n`);
     let consecutiveOldPosts = 0;
     const MAX_CONSECUTIVE_OLD_POSTS = 2;
 
@@ -778,7 +769,7 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
           continue;
         }
 
-        log.info(`[${scrapedPosts.length + 1}/${CONFIG.MAX_POSTS}] Opening post: ${postId}`);
+        console.log(`[${scrapedPosts.length + 1}/${CONFIG.MAX_POSTS}] Opening post: ${postId}`);
 
         postPage = await browser.newPage();
         await postPage.setViewport(getRandomViewport());
@@ -805,16 +796,18 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
             postData.postNumber = scrapedPosts.length + 1;
             scrapedPosts.push(postData);
             runMetrics.postsSaved = scrapedPosts.length;
-            log.info(`✅ Saved post: ${postData.caption?.substring(0, 50)}...`);
+            console.log(`✅ Saved post: ${postData.caption?.substring(0, 50)}...`);
             if (CONFIG.POSTS_PER_RUN_LIMIT && scrapedPosts.length >= CONFIG.POSTS_PER_RUN_LIMIT) {
               postLimitReached = true;
               runMetrics.notes.push(`Post limit ${CONFIG.POSTS_PER_RUN_LIMIT} reached`);
             }
           } else {
             consecutiveOldPosts += 1;
-            log.info(`⏭️  Skipped (too old): ${postData.timeText} (streak: ${consecutiveOldPosts}/${MAX_CONSECUTIVE_OLD_POSTS})`);
+            console.log(
+              `⏭️  Skipped (too old): ${postData.timeText} (streak: ${consecutiveOldPosts}/${MAX_CONSECUTIVE_OLD_POSTS})`
+            );
             if (consecutiveOldPosts >= MAX_CONSECUTIVE_OLD_POSTS) {
-              log.info('⛔ Encountered too many old posts in a row, stopping post scraping early.');
+              console.log('⛔ Encountered too many old posts in a row, stopping post scraping early.');
               postLimitReached = true;
             }
           }
@@ -823,11 +816,11 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
         await postPage.close();
         postPage = null;
       } catch (error) {
-        log.error(`Error with post: ${error.message}`);
+        console.error(`Error with post:`, error.message);
         if (postPage) {
           try {
             await postPage.close();
-          } catch (e) {}
+          } catch {}
         }
       }
 
@@ -837,12 +830,11 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
       }
       if (postLimitReached) break;
     }
-
     if (postLimitReached) {
-      log.info('📵 Post per-run limit reached; stopping post scraping.');
+      console.log('📵 Post per-run limit reached; stopping post scraping.');
     }
 
-    log.info('🎬 Starting to scrape REELS...');
+    console.log(`\n🎬 Starting to scrape REELS...\n`);
     let consecutiveOldReels = 0;
     const MAX_CONSECUTIVE_OLD_REELS = 2;
 
@@ -863,7 +855,7 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
           continue;
         }
 
-        log.info(`[${scrapedReels.length + 1}/${CONFIG.MAX_REELS}] Opening reel: ${reelId}`);
+        console.log(`[${scrapedReels.length + 1}/${CONFIG.MAX_REELS}] Opening reel: ${reelId}`);
 
         reelPage = await browser.newPage();
         await reelPage.setViewport(getRandomViewport());
@@ -890,16 +882,18 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
             reelData.reelNumber = scrapedReels.length + 1;
             scrapedReels.push(reelData);
             runMetrics.reelsSaved = scrapedReels.length;
-            log.info(`✅ Saved reel: ${reelData.caption?.substring(0, 50)}...`);
+            console.log(`✅ Saved reel: ${reelData.caption?.substring(0, 50)}...`);
             if (CONFIG.REELS_PER_RUN_LIMIT && scrapedReels.length >= CONFIG.REELS_PER_RUN_LIMIT) {
               reelLimitReached = true;
               runMetrics.notes.push(`Reel limit ${CONFIG.REELS_PER_RUN_LIMIT} reached`);
             }
           } else {
             consecutiveOldReels += 1;
-            log.info(`⏭️  Skipped (too old): ${reelData.timeText} (streak: ${consecutiveOldReels}/${MAX_CONSECUTIVE_OLD_REELS})`);
+            console.log(
+              `⏭️  Skipped (too old): ${reelData.timeText} (streak: ${consecutiveOldReels}/${MAX_CONSECUTIVE_OLD_REELS})`
+            );
             if (consecutiveOldReels >= MAX_CONSECUTIVE_OLD_REELS) {
-              log.info('⛔ Encountered too many old reels in a row, stopping reel scraping early.');
+              console.log('⛔ Encountered too many old reels in a row, stopping reel scraping early.');
               reelLimitReached = true;
             }
           }
@@ -908,11 +902,11 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
         await reelPage.close();
         reelPage = null;
       } catch (error) {
-        log.error(`Error with reel: ${error.message}`);
+        console.error(`Error with reel:`, error.message);
         if (reelPage) {
           try {
             await reelPage.close();
-          } catch (e) {}
+          } catch {}
         }
       }
 
@@ -922,16 +916,15 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
       }
       if (reelLimitReached) break;
     }
-
     if (reelLimitReached) {
-      log.info('📵 Reel per-run limit reached; stopping reel scraping.');
+      console.log('📵 Reel per-run limit reached; stopping reel scraping.');
     }
 
-    log.info('✓ Scraping completed, closing browser...');
+    console.log('\n✓ Scraping completed, closing browser...');
     try {
       await saveSession(mainPage, sessionLabel);
     } catch (e) {
-      log.warning(`Unable to save session during shutdown: ${e.message}`);
+      console.log('Unable to save session during shutdown:', e.message);
     }
     await mainPage.close();
     await browser.close();
@@ -949,18 +942,16 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
         scrapedAt: new Date().toISOString()
       }
     };
-
     runMetrics.postsSaved = scrapedPosts.length;
     runMetrics.reelsSaved = scrapedReels.length;
     runMetrics.status = 'success';
     runMetrics.finishedAt = result.metadata.scrapedAt;
     runMetrics.notes.push('Run completed successfully');
     await appendRunLog(runMetrics);
-
-    log.info(`[${reqId}] ✓ Scraping completed: ${scrapedPosts.length} posts, ${scrapedReels.length} reels`);
+    console.log(`[${reqId}] ✓ Scraping completed: ${scrapedPosts.length} posts, ${scrapedReels.length} reels`);
     return result;
   } catch (error) {
-    log.error(`[${reqId}] Error in scrapeInstagram: ${error.message}`);
+    console.error(`[${reqId}] Error in scrapeInstagram:`, error.message);
     runMetrics.status = 'error';
     runMetrics.error = error.message;
     runMetrics.finishedAt = new Date().toISOString();
@@ -970,120 +961,172 @@ async function scrapeInstagram(profileUrl, timePeriod = null, requestId = null, 
       try {
         await browser.close();
       } catch (e) {
-        log.error(`[${reqId}] Error closing browser: ${e.message}`);
+        console.error(`[${reqId}] Error closing browser:`, e.message);
       }
     }
     throw error;
   }
 }
 
-async function saveCombinedFile(result, profileUrl, requestId) {
-  await ensureOutputDir();
-  const urlParts = profileUrl.split('/').filter(Boolean);
-  const username =
-    urlParts.find(
-      part =>
-        !part.includes('instagram') &&
-        !part.includes('tagged') &&
-        !part.includes('www') &&
-        !part.includes('http')
-    ) || 'instagram';
-
-  const now = new Date();
-  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
-    now.getDate()
-  ).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(
-    2,
-    '0'
-  )}-${String(now.getSeconds()).padStart(2, '0')}`;
-  const filename = `${username}_posts_and_reels_${dateStr}_${requestId?.substr?.(4, 9) || 'actor'}.json`;
-  const filepath = path.join(CONFIG.OUTPUT_DIR, filename);
-
-  const dataToSave = {
-    profile: profileUrl,
-    scrapedAt: new Date().toISOString(),
-    summary: {
-      totalPosts: result.posts.length,
-      totalReels: result.reels.length,
-      totalContent: result.posts.length + result.reels.length
-    },
-    posts: result.posts,
-    reels: result.reels
-  };
-
-  await fs.writeFile(filepath, JSON.stringify(dataToSave, null, 2), 'utf8');
-  log.info(`📁 Local file saved: ${filepath}`);
-
-  return { filename, filepath, dataToSave };
-}
-
-async function persistResults(result, profileUrl, timePeriod, requestId) {
-  await Actor.pushData({
-    recordType: 'summary',
-    requestId,
-    profileUrl,
-    timePeriod: timePeriod || `last ${CONFIG.DAYS_TO_SCRAPE} days`,
-    ...result.metadata
+app.get('/', (req, res) => {
+  res.json({
+    status: 'running',
+    message: 'Instagram Posts & Reels Scraper (chromium/puppeteer-core)',
+    endpoints: {
+      scrape: 'POST /scrape - Scrape both posts and reels',
+      health: 'GET /health - Health check'
+    }
   });
+});
 
-  for (const post of result.posts) {
-    await Actor.pushData({
-      recordType: 'post',
-      requestId,
-      profileUrl,
-      ...post
-    });
-  }
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
-  for (const reel of result.reels) {
-    await Actor.pushData({
-      recordType: 'reel',
-      requestId,
-      profileUrl,
-      ...reel
-    });
-  }
-
-  await Actor.setValue(`result-${requestId}`, result);
-  return saveCombinedFile(result, profileUrl, requestId);
-}
-
-Actor.main(async () => {
-  const input = (await Actor.getInput()) || {};
-  const profileUrl = input.profileUrl || CONFIG.DEFAULT_PROFILE_URL;
-  const timePeriod = input.timePeriod || null;
+app.post('/scrape', async (req, res) => {
+  const { profileUrl, timePeriod } = req.body;
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
   if (!profileUrl || !profileUrl.includes('instagram.com')) {
-    throw new Error('Input must include a valid Instagram profileUrl');
+    return res.status(400).json({
+      success: false,
+      error: 'Valid Instagram profile URL required'
+    });
   }
 
-  if (timePeriod && !VALID_PERIODS.includes(timePeriod.toLowerCase())) {
-    throw new Error(`Invalid timePeriod. Valid options: ${VALID_PERIODS.join(', ')}`);
+  const validPeriods = [
+    '1h',
+    '1hour',
+    '3h',
+    '3hours',
+    '24h',
+    '24hours',
+    '1day',
+    '1w',
+    '1week',
+    '7days',
+    '1m',
+    '1month',
+    '30days',
+    '1y',
+    '1year',
+    '365days'
+  ];
+  if (timePeriod && !validPeriods.includes(timePeriod.toLowerCase())) {
+    return res.status(400).json({
+      success: false,
+      error: `Invalid time period. Valid options: ${validPeriods.join(', ')}`
+    });
   }
 
-  await ensureOutputDir();
+  try {
+    await ensureOutputDir();
 
-  const proxyUrl = await resolveProxyUrl();
-  const requestId = input.requestId || `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    console.log(`\n[${requestId}] ${'='.repeat(70)}`);
+    console.log(`[${requestId}] 📸🎬 SCRAPING POSTS & REELS: ${profileUrl}`);
+    if (timePeriod) {
+      console.log(`[${requestId}] 📅 Time Period Filter: ${timePeriod}`);
+    }
+    console.log(`[${requestId}] ${'='.repeat(70)}\n`);
 
-  log.info(`\n${'='.repeat(70)}`);
-  log.info(`[${requestId}] 📸🎬 SCRAPING POSTS & REELS: ${profileUrl}`);
-  if (timePeriod) {
-    log.info(`[${requestId}] 📅 Time Period Filter: ${timePeriod}`);
+    const result = await scrapeInstagram(profileUrl, timePeriod, requestId);
+
+    const urlParts = profileUrl.split('/').filter(Boolean);
+    const username =
+      urlParts.find(
+        part => !part.includes('instagram') && !part.includes('tagged') && !part.includes('www') && !part.includes('http')
+      ) || 'instagram';
+
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
+      now.getDate()
+    ).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(
+      2,
+      '0'
+    )}-${String(now.getSeconds()).padStart(2, '0')}`;
+    const filename = `${username}_posts_and_reels_${dateStr}_${requestId.substr(4, 9)}.json`;
+    const filepath = path.join(CONFIG.OUTPUT_DIR, filename);
+
+    const dataToSave = {
+      profile: profileUrl,
+      scrapedAt: new Date().toISOString(),
+      summary: {
+        totalPosts: result.posts.length,
+        totalReels: result.reels.length,
+        totalContent: result.posts.length + result.reels.length
+      },
+      posts: result.posts,
+      reels: result.reels
+    };
+
+    await fs.writeFile(filepath, JSON.stringify(dataToSave, null, 2), 'utf8');
+
+    console.log(`\n${'='.repeat(70)}`);
+    console.log('✓ SCRAPING COMPLETED SUCCESSFULLY');
+    console.log(`${'='.repeat(70)}`);
+    console.log(`📸 Posts scraped: ${result.posts.length}`);
+    console.log(`🎬 Reels scraped: ${result.reels.length}`);
+    console.log(`📁 File saved: ${filename}`);
+    console.log(`📍 Path: ${filepath}`);
+    console.log(`${'='.repeat(70)}\n`);
+
+    res.json({
+      success: true,
+      message: 'Scraping completed successfully',
+      data: {
+        postsCount: result.posts.length,
+        reelsCount: result.reels.length,
+        totalCount: result.posts.length + result.reels.length,
+        filename,
+        filepath,
+        timePeriod: timePeriod || `last ${CONFIG.DAYS_TO_SCRAPE} days`
+      },
+      content: dataToSave
+    });
+  } catch (error) {
+    console.error('\n❌ ERROR:', error.message);
+    console.error('Stack trace:', error.stack);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      details: 'Check server logs for more information'
+    });
   }
-  log.info(`${'='.repeat(70)}\n`);
-
-  const result = await scrapeInstagram(profileUrl, timePeriod, requestId, proxyUrl);
-  const saveMeta = await persistResults(result, profileUrl, timePeriod, requestId);
-
-  log.info(`\n${'='.repeat(70)}`);
-  log.info('✓ SCRAPING COMPLETED SUCCESSFULLY');
-  log.info(`${'='.repeat(70)}`);
-  log.info(`📸 Posts scraped: ${result.posts.length}`);
-  log.info(`🎬 Reels scraped: ${result.reels.length}`);
-  if (saveMeta) {
-    log.info(`📁 File saved: ${saveMeta.filename}`);
-    log.info(`📍 Path: ${saveMeta.filepath}`);
-  }
-  log.info(`${'='.repeat(70)}\n`);
 });
+
+if (process.env.AWS_LAMBDA_FUNCTION_VERSION) {
+} else {
+  app.listen(PORT, async () => {
+    console.log('\n' + '='.repeat(70));
+    console.log('📸🎬 INSTAGRAM POSTS & REELS SCRAPER (chromium aws lambda compatible)');
+    console.log('='.repeat(70));
+    console.log(`📡 Server: http://localhost:${PORT}`);
+    console.log(`📂 Output: ${CONFIG.OUTPUT_DIR}`);
+    console.log(`📅 Scraping last: ${CONFIG.DAYS_TO_SCRAPE} days`);
+    console.log(`📊 Max posts: ${CONFIG.MAX_POSTS} | Max reels: ${CONFIG.MAX_REELS}`);
+    console.log('='.repeat(70));
+    console.log('\n📖 ENDPOINT:');
+    console.log('   POST /scrape - Scrape both posts & reels');
+    console.log('\n💡 USAGE:');
+    console.log(`   curl -X POST http://localhost:${PORT}/scrape \\`);
+    console.log('     -H "Content-Type: application/json" \\');
+    console.log('     -d \'{"profileUrl": "https://www.instagram.com/giva.co/tagged/"}\'');
+    console.log('\n📅 TIME PERIOD FILTERS (optional):');
+    console.log('   - "1h" or "1hour" - Last 1 hour');
+    console.log('   - "3h" or "3hours" - Last 3 hours');
+    console.log('   - "24h" or "24hours" or "1day" - Last 24 hours');
+    console.log('   - "1w" or "1week" or "7days" - Last 1 week');
+    console.log('   - "1m" or "1month" or "30days" - Last 1 month');
+    console.log('   - "1y" or "1year" or "365days" - Last 1 year');
+    console.log(`\n   Example with filter:`);
+    console.log(`   curl -X POST http://localhost:${PORT}/scrape \\`);
+    console.log('     -H "Content-Type: application/json" \\');
+    console.log('     -d \'{"profileUrl": "https://www.instagram.com/username/", "timePeriod": "1h"}\'');
+    console.log('\n' + '='.repeat(70) + '\n');
+
+    await ensureOutputDir();
+  });
+}
+
+export default app;
+

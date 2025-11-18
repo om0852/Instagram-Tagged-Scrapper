@@ -1,0 +1,30 @@
+# Environment variables
+.env
+
+# Dependencies
+node_modules/
+
+# Scraped data
+scraped_instagram/
+
+# Session data (contains sensitive cookies)
+session_data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Screenshots
+*.png
+login_error.png
+

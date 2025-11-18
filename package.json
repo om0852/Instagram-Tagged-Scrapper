@@ -1,0 +1,28 @@
+{
+  "name": "instagram-scraper",
+  "version": "1.0.0",
+  "description": "Instagram Posts & Reels Scraper API",
+  "main": "optimize.js",
+  "scripts": {
+    "start": "node optimize.js",
+    "dev": "node optimize.js"
+  },
+  "keywords": [
+    "instagram",
+    "scraper",
+    "puppeteer"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "puppeteer": "^24.30.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "random-useragent": "^0.5.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

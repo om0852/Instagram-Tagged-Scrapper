@@ -2,10 +2,12 @@
   "name": "instagram-scraper",
   "version": "1.0.0",
   "description": "Instagram Posts & Reels Scraper API",
-  "main": "optimize.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node optimize.js",
-    "dev": "node optimize.js"
+    "start": "node index.js",
+    "dev": "node index.js",
+    "postinstall": "npx puppeteer browsers install chrome"
+
   },
   "keywords": [
     "instagram",

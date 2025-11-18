@@ -2,10 +2,10 @@
   "name": "instagram-scraper",
   "version": "1.0.0",
   "description": "Instagram Posts & Reels Scraper API",
-  "main": "index.js",
+  "main": "lambda.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node lambda.js",
+    "dev": "node lambda.js"
   },
   "keywords": [
     "instagram",
@@ -15,8 +15,6 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "apify": "^3.5.2",
-    "chrome-aws-lambda": "^10.1.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "puppeteer": "^24.30.0",
